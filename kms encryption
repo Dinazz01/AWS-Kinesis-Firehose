@@ -1,0 +1,454 @@
+What this resource is overall
+
+This Terraform resource creates an AWS Kinesis Firehose delivery stream that:
+
+Sends data to S3
+
+Optionally runs a Lambda function to process records before they land in S3
+
+The key idea:
+👉 Lambda processing is enabled only when a variable is set, otherwise it is completely omitted.
+
+Resource block
+resource "aws_kinesis_firehose_delivery_stream" "firehose_stream" {
+  name        = var.delivery_stream_name
+  destination = "extended_s3"
+
+
+Creates a Firehose delivery stream
+
+Uses the extended S3 destination, which supports:
+
+buffering
+
+compression
+
+encryption
+
+record processing (Lambda)
+
+Extended S3 configuration
+extended_s3_configuration {
+  role_arn           = var.firehose_role_arn
+  bucket_arn         = var.s3_bucket_arn
+  buffering_size     = var.buffering_size
+  buffering_interval = var.buffering_interval
+
+
+This configures:
+
+IAM role Firehose assumes
+
+Target S3 bucket
+
+Buffering behavior:
+
+buffering_size → MB before flush
+
+buffering_interval → seconds before flush
+
+So far, this is standard Firehose → S3.
+
+⭐ The important part: dynamic "processing_configuration"
+dynamic "processing_configuration" {
+  for_each = var.enable_lambda_processor ? [1] : []
+
+What this does
+
+This is a conditional block.
+
+If enable_lambda_processor = true
+→ for_each = [1] → block is created
+
+If enable_lambda_processor = false
+→ for_each = [] → block is not created at all
+
+👉 This is the only safe way in Terraform to conditionally include nested blocks.
+
+This avoids:
+
+Invalid config
+
+Null hacks
+
+Duplicate resources
+
+Block contents
+content {
+  enabled = "true"
+
+
+Turns processing on when the block exists.
+
+Lambda processor definition
+processors {
+  type = "Lambda"
+
+
+Declares a Lambda processor
+
+Firehose will invoke this Lambda for each batch of records
+
+Processor parameters
+parameters {
+  parameter_name  = var.lambda_parameter_name
+  parameter_value = var.lambda_function_arn
+}
+
+
+This usually resolves to:
+
+parameter_name  = "LambdaArn"
+parameter_value = "arn:aws:lambda:..."
+
+
+Meaning:
+
+Firehose invokes this Lambda function
+
+Lambda can:
+
+transform records
+
+enrich data
+
+drop invalid events
+
+change output format
+
+Why this pattern is GOOD (interview-worthy)
+✅ Clean optional behavior
+
+No duplicated resources
+
+No branching modules
+
+One stream, multiple behaviors
+
+✅ Terraform-native
+
+Uses dynamic blocks correctly
+
+Uses for_each safely
+
+No reliance on count inside nested blocks (which Terraform doesn’t support)
+
+✅ Reusable module
+
+This lets consumers decide:
+
+enable_lambda_processor = true
+lambda_function_arn    = aws_lambda_function.transform.arn
+
+
+or turn it off entirely.
+
+What happens at runtime
+If Lambda is enabled
+Producer → Firehose → Lambda → S3
+
+If Lambda is disabled
+Producer → Firehose → S3
+
+
+Same infrastructure, different behavior.
+
+Common mistakes this code avoids (good signal)
+
+❌ Trying to use count inside a nested block
+❌ Leaving empty processing blocks (causes API errors)
+❌ Creating separate Firehose resources
+❌ Passing null Lambda ARNs
+
+One-sentence interview explanation
+
+“This Firehose stream delivers data to S3 and conditionally applies a Lambda processor using a dynamic block, so record transformation can be enabled or disabled via configuration without duplicating infrastructure.”
+
+========================================================================================================================================================================================================================
+Below is the standard way to add KMS encryption to your Firehose extended_s3 destination, plus the IAM + key policy you need so Firehose can actually use the key.
+
+1) Add KMS encryption to the Firehose extended_s3_configuration
+
+Inside your existing extended_s3_configuration { ... }, add:
+
+extended_s3_configuration {
+  role_arn           = var.firehose_role_arn
+  bucket_arn         = var.s3_bucket_arn
+  buffering_size     = var.buffering_size
+  buffering_interval = var.buffering_interval
+
+  # ✅ KMS encryption for objects written to S3 by Firehose
+  kms_key_arn = var.kms_key_arn
+
+  dynamic "processing_configuration" {
+    for_each = var.enable_lambda_processor ? [1] : []
+    content {
+      enabled = "true"
+      processors {
+        type = "Lambda"
+        parameters {
+          parameter_name  = var.lambda_parameter_name
+          parameter_value = var.lambda_function_arn
+        }
+      }
+    }
+  }
+}
+
+
+Add this variable:
+
+variable "kms_key_arn" {
+  description = "KMS key ARN used by Firehose to encrypt objects delivered to S3"
+  type        = string
+}
+
+
+Notes:
+
+kms_key_arn in extended_s3_configuration encrypts the S3 objects Firehose writes (SSE-KMS).
+
+Your S3 bucket must allow SSE-KMS with that key, and Firehose role must be permitted to use it.
+
+2) IAM permissions: Firehose role must be allowed to use the KMS key
+
+Attach a policy to the Firehose IAM role that allows KMS use. Minimum practical permissions:
+
+data "aws_iam_policy_document" "firehose_kms" {
+  statement {
+    sid = "AllowKmsForFirehoseS3Delivery"
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+    resources = [var.kms_key_arn]
+  }
+}
+
+
+Then attach it:
+
+resource "aws_iam_role_policy" "firehose_kms" {
+  name   = "${var.delivery_stream_name}-kms"
+  role   = aws_iam_role.firehose.id
+  policy = data.aws_iam_policy_document.firehose_kms.json
+}
+
+
+If your role is defined elsewhere, just attach the doc to that role.
+
+3) KMS key policy: allow the Firehose role to use the key
+
+Even if the role has IAM permissions, KMS also enforces the key policy. Ensure the key policy includes the Firehose role principal.
+
+Example key policy statement (add to your aws_kms_key policy):
+
+data "aws_iam_policy_document" "kms_key_policy" {
+  statement {
+    sid = "EnableRootPermissions"
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "AllowFirehoseRoleUseOfKey"
+    principals {
+      type        = "AWS"
+      identifiers = [var.firehose_role_arn]
+    }
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+  }
+}
+
+
+Then:
+
+resource "aws_kms_key" "firehose" {
+  description             = "KMS key for Firehose S3 delivery"
+  deletion_window_in_days = 30
+  policy                  = data.aws_iam_policy_document.kms_key_policy.json
+}
+
+
+And pass:
+
+kms_key_arn = aws_kms_key.firehose.arn
+
+4) (Optional but common) Ensure S3 bucket policy allows SSE-KMS writes
+
+If your bucket policy is restrictive, make sure it allows the Firehose role to s3:PutObject and allows using SSE-KMS headers. If you want, paste your bucket policy (or say “none”) and I’ll give you the exact statement.
+
+Quick sanity checklist (when it still fails)
+
+Firehose role has IAM KMS permissions ✅
+
+KMS key policy includes the Firehose role principal ✅
+
+Bucket policy (if any) allows Firehose PutObject ✅
+
+Key is in the same region as Firehose/S3 ✅
+
+If you share your existing firehose_role_arn (or role resource name) and whether you want a new KMS key created by the module vs passing an existing key, I can stitch this into a clean module pattern with toggles like enable_kms = true.
+
+============================================================================================================================================================================================================
+
+Perfect — this screenshot is describing a security/compliance rule (very likely from AWS Config / Security Hub / CIS / custom policy) and it’s important to understand what encryption it is actually checking, because this trips people up a lot.
+
+I’ll explain:
+
+What this rule means (plain English)
+
+What AWS field it checks
+
+Why S3-only encryption is NOT enough
+
+Exactly what Terraform config satisfies the rule
+
+1️⃣ What the rule is saying (plain English)
+
+“Kinesis Data Firehose encryption should be enabled”
+
+This rule is NOT talking about S3 encryption alone.
+
+It checks whether the Firehose delivery stream itself has server-side encryption enabled using AWS KMS.
+
+The rule FAILS if:
+
+DeliveryStreamEncryptionConfiguration.Status = DISABLED, or
+
+DeliveryStreamEncryptionConfiguration is missing entirely
+
+So even if:
+
+Your S3 bucket is encrypted
+
+Your Firehose writes encrypted objects
+
+❌ You can still fail this rule.
+
+2️⃣ What AWS is actually checking under the hood
+
+This rule checks the Firehose property:
+
+DeliveryStreamEncryptionConfiguration
+
+
+This controls encryption at rest inside Firehose, including:
+
+Data buffers
+
+Temporary storage
+
+Records before delivery
+
+This is separate from S3 encryption.
+
+3️⃣ Why S3 KMS encryption alone does NOT satisfy this rule
+
+You already added this (which is good):
+
+extended_s3_configuration {
+  kms_key_arn = var.kms_key_arn
+}
+
+
+✅ This encrypts objects written to S3
+❌ This does NOT enable Firehose stream encryption
+
+So Security Hub / Config still sees:
+
+DeliveryStreamEncryptionConfiguration = MISSING
+
+
+→ ❌ Rule fails
+
+4️⃣ The REQUIRED Terraform config to pass this rule ✅
+
+You must enable Firehose stream encryption, which is configured at the resource level, not inside extended_s3_configuration.
+
+✅ Correct Terraform fix
+
+Add this block to your Firehose resource:
+
+resource "aws_kinesis_firehose_delivery_stream" "firehose_stream" {
+  name        = var.delivery_stream_name
+  destination = "extended_s3"
+
+  # ✅ REQUIRED: Firehose stream encryption
+  server_side_encryption {
+    enabled  = true
+    key_type = "CUSTOMER_MANAGED_CMK"
+    key_arn  = var.kms_key_arn
+  }
+
+  extended_s3_configuration {
+    role_arn           = var.firehose_role_arn
+    bucket_arn         = var.s3_bucket_arn
+    buffering_size     = var.buffering_size
+    buffering_interval = var.buffering_interval
+
+    # Optional but recommended (encrypts S3 objects)
+    kms_key_arn = var.kms_key_arn
+
+    dynamic "processing_configuration" {
+      for_each = var.enable_lambda_processor ? [1] : []
+      content {
+        enabled = "true"
+        processors {
+          type = "Lambda"
+          parameters {
+            parameter_name  = var.lambda_parameter_name
+            parameter_value = var.lambda_function_arn
+          }
+        }
+      }
+    }
+  }
+}
+
+5️⃣ What this satisfies (compliance mapping)
+Control	Status
+Firehose encryption at rest	✅ PASS
+DeliveryStreamEncryptionConfiguration present	✅ PASS
+S3 object encryption	✅ PASS
+HIPAA / CIS / Security Hub	✅ PASS
+6️⃣ IAM & KMS reminders (quick)
+
+Your Firehose role must have:
+
+kms:Encrypt
+kms:Decrypt
+kms:GenerateDataKey*
+kms:DescribeKey
+
+
+And the KMS key policy must trust:
+
+firehose.amazonaws.com
+or the Firehose IAM role
+
+
+(You already did this part correctly earlier.)
+
+7️⃣ One-line explanation (great for audits & interviews)
+
+“Firehose requires two layers of encryption: stream-level encryption using server_side_encryption for internal buffering, and destination-level encryption for S3. Compliance rules check the stream-level setting specifically.”
+
+
+
+
+
