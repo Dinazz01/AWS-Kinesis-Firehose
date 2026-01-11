@@ -173,3 +173,25 @@ Compliance rule passes because server_side_encryption { ... } creates DeliverySt
 Your S3 writes are encrypted via extended_s3_configuration.kms_key_arn when enabled.
 
 Lambda processing is included only when enabled (no invalid empty blocks).
+
+==================================================================================================================
+
+module "firehose_logs" {
+  source = "./modules/firehose"
+
+  delivery_stream_name = "logs-firehose-prod"
+  firehose_role_arn    = aws_iam_role.firehose.arn
+  s3_bucket_arn        = aws_s3_bucket.logs.arn
+
+  buffering_size     = 5
+  buffering_interval = 300
+
+  # 🔐 Encryption (REQUIRED for compliance)
+  enable_firehose_encryption = true
+  enable_s3_kms_encryption   = true
+  kms_key_arn                = aws_kms_key.firehose.arn
+
+  # ❌ No Lambda processing
+  enable_lambda_processor = false
+}
+
