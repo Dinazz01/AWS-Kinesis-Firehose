@@ -1,0 +1,175 @@
+erraform: Firehose Delivery Stream (Extended S3 + KMS + Optional Lambda)
+############################################
+# Variables
+############################################
+
+variable "delivery_stream_name" {
+  type        = string
+  description = "Name of the Firehose delivery stream"
+}
+
+variable "firehose_role_arn" {
+  type        = string
+  description = "IAM role ARN assumed by Firehose"
+}
+
+variable "s3_bucket_arn" {
+  type        = string
+  description = "Destination S3 bucket ARN"
+}
+
+variable "buffering_size" {
+  type        = number
+  description = "Buffer incoming data to the specified size in MBs before delivering to S3"
+  default     = 5
+}
+
+variable "buffering_interval" {
+  type        = number
+  description = "Buffer incoming data for the specified interval in seconds before delivering to S3"
+  default     = 300
+}
+
+# --- Encryption toggles ---
+variable "enable_firehose_encryption" {
+  type        = bool
+  description = "Enable Firehose delivery stream encryption (DeliveryStreamEncryptionConfiguration)"
+  default     = true
+}
+
+variable "enable_s3_kms_encryption" {
+  type        = bool
+  description = "Enable SSE-KMS for objects written by Firehose to S3 (extended_s3_configuration.kms_key_arn)"
+  default     = true
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "KMS CMK ARN to use for Firehose stream encryption and/or S3 object encryption"
+  default     = null
+
+  validation {
+    condition = (
+      (var.enable_firehose_encryption || var.enable_s3_kms_encryption)
+      ? (var.kms_key_arn != null && length(trim(var.kms_key_arn)) > 0)
+      : true
+    )
+    error_message = "kms_key_arn must be set when enable_firehose_encryption or enable_s3_kms_encryption is true."
+  }
+}
+
+# --- Optional Lambda processor ---
+variable "enable_lambda_processor" {
+  type        = bool
+  description = "Enable Firehose Lambda processing configuration"
+  default     = false
+}
+
+variable "lambda_function_arn" {
+  type        = string
+  description = "Lambda function ARN used by Firehose processor"
+  default     = null
+}
+
+variable "lambda_parameter_name" {
+  type        = string
+  description = "Processor parameter name (usually 'LambdaArn')"
+  default     = "LambdaArn"
+}
+
+############################################
+# Locals
+############################################
+
+locals {
+  # If toggles are off, pass null so provider omits optional attributes
+  s3_kms_key_arn = var.enable_s3_kms_encryption ? var.kms_key_arn : null
+}
+
+############################################
+# Firehose Delivery Stream
+############################################
+
+resource "aws_kinesis_firehose_delivery_stream" "this" {
+  name        = var.delivery_stream_name
+  destination = "extended_s3"
+
+  # ✅ REQUIRED for the compliance rule in your screenshot:
+  # Creates DeliveryStreamEncryptionConfiguration with Status=ENABLED
+  dynamic "server_side_encryption" {
+    for_each = var.enable_firehose_encryption ? [1] : []
+    content {
+      enabled  = true
+      key_type = "CUSTOMER_MANAGED_CMK"
+      key_arn  = var.kms_key_arn
+    }
+  }
+
+  extended_s3_configuration {
+    role_arn           = var.firehose_role_arn
+    bucket_arn         = var.s3_bucket_arn
+    buffering_size     = var.buffering_size
+    buffering_interval = var.buffering_interval
+
+    # ✅ Encrypt S3 objects (recommended)
+    kms_key_arn = local.s3_kms_key_arn
+
+    # ✅ Optional Lambda record processor
+    dynamic "processing_configuration" {
+      for_each = var.enable_lambda_processor ? [1] : []
+      content {
+        enabled = true
+
+        processors {
+          type = "Lambda"
+
+          parameters {
+            parameter_name  = var.lambda_parameter_name
+            parameter_value = var.lambda_function_arn
+          }
+        }
+      }
+    }
+  }
+}
+
+Attach required KMS permissions to the Firehose role (must-have)
+
+If you don’t already have it, attach this to the Firehose IAM role:
+
+data "aws_iam_policy_document" "firehose_kms" {
+  statement {
+    sid = "AllowKmsForFirehose"
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+    resources = [var.kms_key_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "firehose_kms" {
+  name   = "${var.delivery_stream_name}-kms"
+  role   = replace(var.firehose_role_arn, "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/", "")
+  policy = data.aws_iam_policy_document.firehose_kms.json
+}
+
+data "aws_caller_identity" "current" {}
+
+
+If you have the role as a Terraform resource (recommended), use role = aws_iam_role.firehose.name instead of the replace(...) trick.
+
+Key policy reminder (so KMS actually works)
+
+Your KMS key policy must allow the Firehose role principal to use the key. The simplest safe pattern is to include a statement that allows the role ARN (same permissions as above).
+
+What this configuration guarantees
+
+Compliance rule passes because server_side_encryption { ... } creates DeliveryStreamEncryptionConfiguration and sets it to enabled.
+
+Your S3 writes are encrypted via extended_s3_configuration.kms_key_arn when enabled.
+
+Lambda processing is included only when enabled (no invalid empty blocks).
