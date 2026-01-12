@@ -1,0 +1,224 @@
+Got you. For AWS-owned key encryption (no CMK you manage), the key difference is:
+
+Firehose stream encryption (the compliance rule you showed) uses:
+
+server_side_encryption { key_type = "AWS_OWNED_CMK" }
+
+NO key_arn
+
+S3 object encryption is not configured with a KMS key ARN in the Firehose block anymore. Instead you usually enforce encryption at the S3 bucket level (SSE-S3 or SSE-KMS with AWS-managed key alias/aws/s3).
+
+Below is the full consolidated module code + how to call it, using AWS-owned key for Firehose.
+
+Module code (AWS-owned key for Firehose stream encryption)
+modules/firehose/main.tf
+############################################
+# Variables
+############################################
+
+variable "delivery_stream_name" {
+  type        = string
+  description = "Name of the Firehose delivery stream"
+}
+
+variable "firehose_role_arn" {
+  type        = string
+  description = "IAM role ARN assumed by Firehose"
+}
+
+variable "s3_bucket_arn" {
+  type        = string
+  description = "Destination S3 bucket ARN"
+}
+
+variable "buffering_size" {
+  type        = number
+  description = "Buffer size in MBs before delivering to S3"
+  default     = 5
+}
+
+variable "buffering_interval" {
+  type        = number
+  description = "Buffer interval in seconds before delivering to S3"
+  default     = 300
+}
+
+# --- Firehose stream encryption (compliance control) ---
+variable "enable_firehose_encryption" {
+  type        = bool
+  description = "Enable Firehose delivery stream encryption (DeliveryStreamEncryptionConfiguration)"
+  default     = true
+}
+
+# --- Optional Lambda processor ---
+variable "enable_lambda_processor" {
+  type        = bool
+  description = "Enable Firehose Lambda processing configuration"
+  default     = false
+}
+
+variable "lambda_function_arn" {
+  type        = string
+  description = "Lambda function ARN used by Firehose processor"
+  default     = null
+}
+
+variable "lambda_parameter_name" {
+  type        = string
+  description = "Processor parameter name (usually 'LambdaArn')"
+  default     = "LambdaArn"
+}
+
+# Guardrail: if Lambda processor enabled, lambda_function_arn must be set
+locals {
+  lambda_arn_required_ok = var.enable_lambda_processor ? (var.lambda_function_arn != null && length(trim(var.lambda_function_arn)) > 0) : true
+}
+
+############################################
+# Firehose Delivery Stream
+############################################
+
+resource "aws_kinesis_firehose_delivery_stream" "this" {
+  name        = var.delivery_stream_name
+  destination = "extended_s3"
+
+  # ✅ AWS-owned key encryption for the Firehose stream itself
+  # This creates DeliveryStreamEncryptionConfiguration with Status=ENABLED
+  dynamic "server_side_encryption" {
+    for_each = var.enable_firehose_encryption ? [1] : []
+    content {
+      enabled  = true
+      key_type = "AWS_OWNED_CMK"
+      # No key_arn when using AWS-owned key
+    }
+  }
+
+  extended_s3_configuration {
+    role_arn           = var.firehose_role_arn
+    bucket_arn         = var.s3_bucket_arn
+    buffering_size     = var.buffering_size
+    buffering_interval = var.buffering_interval
+
+    # NOTE:
+    # We intentionally do NOT set kms_key_arn here because that is for SSE-KMS with a CMK.
+    # With AWS-owned keys for Firehose, enforce S3 object encryption at the S3 bucket level.
+
+    dynamic "processing_configuration" {
+      for_each = var.enable_lambda_processor ? [1] : []
+      content {
+        enabled = true
+
+        processors {
+          type = "Lambda"
+
+          parameters {
+            parameter_name  = var.lambda_parameter_name
+            parameter_value = var.lambda_function_arn
+          }
+        }
+      }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = local.lambda_arn_required_ok
+      error_message = "enable_lambda_processor is true but lambda_function_arn is null/empty."
+    }
+  }
+}
+
+(Optional but recommended) Outputs
+
+modules/firehose/outputs.tf
+
+output "delivery_stream_name" {
+  value       = aws_kinesis_firehose_delivery_stream.this.name
+  description = "Firehose delivery stream name"
+}
+
+output "delivery_stream_arn" {
+  value       = aws_kinesis_firehose_delivery_stream.this.arn
+  description = "Firehose delivery stream ARN"
+}
+
+Root usage: How to call the module (AWS-owned key)
+Example 1 — Firehose encrypted (AWS-owned key) → S3, no Lambda
+module "firehose_logs" {
+  source = "./modules/firehose"
+
+  delivery_stream_name = "logs-firehose-prod"
+  firehose_role_arn    = aws_iam_role.firehose.arn
+  s3_bucket_arn        = aws_s3_bucket.logs.arn
+
+  buffering_size     = 5
+  buffering_interval = 300
+
+  # ✅ Must be true to satisfy the compliance rule
+  enable_firehose_encryption = true
+
+  # No Lambda
+  enable_lambda_processor = false
+}
+
+Example 2 — Firehose encrypted (AWS-owned key) + Lambda processing
+module "firehose_events" {
+  source = "./modules/firehose"
+
+  delivery_stream_name = "events-firehose-prod"
+  firehose_role_arn    = aws_iam_role.firehose.arn
+  s3_bucket_arn        = aws_s3_bucket.events.arn
+
+  buffering_size     = 5
+  buffering_interval = 300
+
+  enable_firehose_encryption = true
+
+  enable_lambda_processor = true
+  lambda_function_arn     = aws_lambda_function.transform.arn
+  lambda_parameter_name   = "LambdaArn"
+}
+
+Important: Encrypting the S3 objects (AWS-owned vs AWS-managed)
+
+Because we removed extended_s3_configuration.kms_key_arn (that’s for your own CMK), you should enforce encryption on the S3 bucket.
+
+Option A (Most “AWS-owned” / simplest): SSE-S3 (AES256)
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+Option B: SSE-KMS with AWS-managed key (alias/aws/s3)
+
+This uses AWS-managed KMS (not customer-managed). Many orgs accept this.
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = "alias/aws/s3"
+    }
+  }
+}
+
+
+If your compliance specifically says “AWS owned key” for Firehose, that’s the Firehose stream encryption block above.
+For S3, policies often allow either SSE-S3 or SSE-KMS (AWS-managed). If you tell me which your control requires, I’ll lock it in.
+
+IAM note (what changes when using AWS-owned key)
+
+When Firehose uses AWS_OWNED_CMK:
+
+✅ You do not need KMS permissions for Firehose (no CMK involved)
+
+You still need normal S3 permissions: s3:PutObject, s3:ListBucket, etc.
+
+If you choose SSE-KMS (alias/aws/s3) at the bucket, S3 handles encryption and Firehose typically does not need CMK permissions (but bucket policies can change that).
