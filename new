@@ -1,0 +1,268 @@
+
+modules/aws-kinesis-firehose/main.tf
+
+############################################
+# Data
+############################################
+data "aws_caller_identity" "current" {}
+
+############################################
+# Variables
+############################################
+variable "delivery_stream_name" {
+  type        = string
+  description = "Firehose delivery stream name"
+}
+
+variable "buffering_size" {
+  type        = number
+  default     = 5
+}
+
+variable "buffering_interval" {
+  type        = number
+  default     = 300
+}
+
+# Compliance rule: DeliveryStreamEncryptionConfiguration must exist and be ENABLED
+variable "enable_firehose_encryption" {
+  type        = bool
+  default     = true
+  description = "Enable Firehose stream encryption (AWS-owned key) to satisfy compliance"
+}
+
+# Optional Lambda processor
+variable "enable_lambda_processor" {
+  type        = bool
+  default     = false
+}
+
+variable "lambda_function_arn" {
+  type        = string
+  default     = null
+}
+
+variable "lambda_parameter_name" {
+  type        = string
+  default     = "LambdaArn"
+}
+
+# ---- Shared S3 bucket module settings ----
+variable "s3_bucket_module_source" {
+  type        = string
+  description = "Source for the shared S3 bucket module"
+  default     = "terraform.xxx/aws-s3-bucket-module/aws"
+}
+
+variable "s3_bucket_module_version" {
+  type        = string
+  description = "Version for the shared S3 bucket module"
+  default     = null
+}
+
+variable "bucket_name" {
+  type        = string
+  description = "S3 bucket name (must be globally unique). If null, module generates a name."
+  default     = null
+}
+
+variable "versioning_enabled" {
+  type        = bool
+  description = "Enable bucket versioning"
+  default     = true
+}
+
+############################################
+# Locals
+############################################
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+
+  effective_bucket_name = coalesce(
+    var.bucket_name,
+    "firehose-logs-${local.account_id}-${var.delivery_stream_name}"
+  )
+}
+
+############################################
+# S3 bucket via shared module (existing)
+############################################
+module "aws-s3-bucket" {
+  source  = var.s3_bucket_module_source
+  version = var.s3_bucket_module_version
+
+  # based on your screenshot, module expects bucket_name
+  bucket_name        = local.effective_bucket_name
+  versioning_enabled = var.versioning_enabled
+}
+
+############################################
+# Bucket encryption (SSE-S3 / AES256)
+# NOTE: bucket is created by module, we reference module.s3_bucket_id
+############################################
+resource "aws_s3_bucket_server_side_encryption_configuration" "firehose_logs" {
+  bucket = module.aws-s3-bucket.s3_bucket_id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+############################################
+# IAM role for Firehose
+############################################
+resource "aws_iam_role" "firehose" {
+  name = "${var.delivery_stream_name}-firehose-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "firehose.amazonaws.com" }
+    }]
+  })
+}
+
+############################################
+# IAM policy: Firehose -> S3 access
+############################################
+resource "aws_iam_role_policy" "firehose_s3" {
+  name = "${var.delivery_stream_name}-s3-policy"
+  role = aws_iam_role.firehose.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:AbortMultipartUpload",
+        "s3:GetBucketLocation",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:ListBucketMultipartUploads",
+        "s3:PutObject"
+      ]
+      Resource = [
+        module.aws-s3-bucket.s3_bucket_arn,
+        "${module.aws-s3-bucket.s3_bucket_arn}/*"
+      ]
+    }]
+  })
+}
+
+############################################
+# Optional: IAM policy for Lambda invocation
+############################################
+resource "aws_iam_role_policy" "firehose_lambda" {
+  count = var.enable_lambda_processor ? 1 : 0
+
+  name = "${var.delivery_stream_name}-lambda-policy"
+  role = aws_iam_role.firehose.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "lambda:InvokeFunction",
+        "lambda:GetFunctionConfiguration"
+      ]
+      Resource = var.lambda_function_arn
+    }]
+  })
+}
+
+############################################
+# Firehose Delivery Stream (Extended S3)
+############################################
+resource "aws_kinesis_firehose_delivery_stream" "firehose_stream" {
+  name        = var.delivery_stream_name
+  destination = "extended_s3"
+
+  # ✅ Compliance: creates DeliveryStreamEncryptionConfiguration Status=ENABLED
+  dynamic "server_side_encryption" {
+    for_each = var.enable_firehose_encryption ? [1] : []
+    content {
+      enabled  = true
+      key_type = "AWS_OWNED_CMK"
+    }
+  }
+
+  extended_s3_configuration {
+    role_arn           = aws_iam_role.firehose.arn
+    bucket_arn         = module.aws-s3-bucket.s3_bucket_arn
+    buffering_size     = var.buffering_size
+    buffering_interval = var.buffering_interval
+
+    dynamic "processing_configuration" {
+      for_each = var.enable_lambda_processor ? [1] : []
+      content {
+        enabled = true
+
+        processors {
+          type = "Lambda"
+
+          parameters {
+            parameter_name  = var.lambda_parameter_name
+            parameter_value = var.lambda_function_arn
+          }
+        }
+      }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.enable_lambda_processor ? (var.lambda_function_arn != null && length(trim(var.lambda_function_arn)) > 0) : true
+      error_message = "enable_lambda_processor is true but lambda_function_arn is not set."
+    }
+  }
+}
+
+## modules/aws-kinesis-firehose/outputs.tf
+
+output "delivery_stream_arn" {
+  value       = aws_kinesis_firehose_delivery_stream.firehose_stream.arn
+  description = "Firehose delivery stream ARN"
+}
+
+output "bucket_id" {
+  value       = module.aws-s3-bucket.s3_bucket_id
+  description = "S3 bucket id from shared bucket module"
+}
+
+output "bucket_arn" {
+  value       = module.aws-s3-bucket.s3_bucket_arn
+  description = "S3 bucket ARN from shared bucket module"
+}
+
+output "firehose_role_arn" {
+  value       = aws_iam_role.firehose.arn
+  description = "IAM role ARN assumed by Firehose"
+}
+
+#####################################
+
+##Root call example
+
+module "firehose_logs" {
+  source = "./modules/aws-kinesis-firehose"
+
+  delivery_stream_name = "logs-firehose-test"
+  buffering_size       = 5
+  buffering_interval   = 300
+
+  enable_firehose_encryption = true
+
+  # optional overrides
+  # bucket_name = "firehose-logs-123456789012-logs-firehose-test"
+  versioning_enabled = true
+
+  enable_lambda_processor = false
+}
+
+
+
